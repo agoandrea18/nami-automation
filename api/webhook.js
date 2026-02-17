@@ -4,10 +4,6 @@
 // - orders/paid          -> Accumula (GIACENZA + HOLD) / SDA (tag trigger)
 // - fulfillments/create  -> quando Shopify genera l'evasione (tracking), accorpa la GIACENZA
 //
-// NOTE:
-// - Admin API shop domain deve essere *.myshopify.com (es: gb6zdg-vk.myshopify.com)
-// - Token Admin API (24h) via client_credentials grant
-//
 // ENV richieste:
 // - SHOPIFY_SHOP_DOMAIN=gb6zdg-vk.myshopify.com
 // - SHOPIFY_API_KEY=xxxx
@@ -189,13 +185,13 @@ function verifyHmac(rawBody, hmacHeader) {
 
 // =========================
 // Fulfillment hold / release hold (GraphQL 2026-01)
-/// IMPORTANT: fulfillmentOrderHold richiede fulfillmentHold: FulfillmentHoldInput!
-/// (non più reason/reasonNotes top-level)
+// CORRETTO: FulfillmentOrderHoldInput! (non FulfillmentHoldInput!)
+// e firma: fulfillmentOrderHold(fulfillmentHold: ..., id: ...)
 // =========================
 async function holdFulfillmentOrders(fulfillmentOrderGids, note = "Ordine in giacenza (Accumula da Nami!)") {
   const m = `
-    mutation Hold($id: ID!, $fulfillmentHold: FulfillmentHoldInput!) {
-      fulfillmentOrderHold(id: $id, fulfillmentHold: $fulfillmentHold) {
+    mutation Hold($id: ID!, $fulfillmentHold: FulfillmentOrderHoldInput!) {
+      fulfillmentOrderHold(fulfillmentHold: $fulfillmentHold, id: $id) {
         fulfillmentOrder { id status }
         userErrors { field message }
       }
@@ -208,6 +204,8 @@ async function holdFulfillmentOrders(fulfillmentOrderGids, note = "Ordine in gia
       fulfillmentHold: {
         reason: "OTHER",
         reasonNotes: note,
+        // opzionali (lasciati semplici)
+        notifyMerchant: false,
       },
     });
 
@@ -244,20 +242,16 @@ async function getFulfillmentOrdersRest(orderId) {
 }
 
 async function getFulfillmentOrderGidsWithRetry(orderId) {
-  // retry: 0s, 2s, 5s, 10s, 20s
   const waits = [0, 2000, 5000, 10000, 20000];
-
   for (const w of waits) {
     if (w) {
       console.log(`🕒 ACCUMULA -> FO non pronti, riprovo tra ${w}ms...`);
       await sleep(w);
     }
-
     const fos = await getFulfillmentOrdersRest(orderId);
     const gids = fos.map((fo) => fulfillmentOrderGidFromRestId(fo.id));
     if (gids.length) return { fos, gids };
   }
-
   return { fos: [], gids: [] };
 }
 
@@ -273,7 +267,6 @@ async function handleOrdersPaid(payload) {
 
   console.log(`📦 orders/paid: ${orderName} | shipping: ${shippingTitle} | tags: ${(payload?.tags || "").trim?.() || ""}`);
 
-  // Leggiamo live order (tags/customer)
   const orderResp = await shopifyRest(
     `/admin/api/2026-01/orders/${orderId}.json?fields=id,name,tags,customer,fulfillment_status,shipping_lines`,
     { method: "GET" }
@@ -281,7 +274,7 @@ async function handleOrdersPaid(payload) {
   const live = orderResp.order;
   const currentTags = live?.tags || "";
 
-  // A) ACCUMULA -> tag GIACENZA + HOLD FO
+  // A) ACCUMULA
   if (shippingTitle === SHIPPING_ACCUMULA) {
     const wouldTags = addTags(currentTags, [TAG_GIACENZA]);
     console.log("🧊 ACCUMULA -> vorrei taggare GIACENZA:", wouldTags);
@@ -303,7 +296,7 @@ async function handleOrdersPaid(payload) {
     return "OK GIACENZA";
   }
 
-  // B) SDA -> tag trigger (merge avviene su fulfillments/create)
+  // B) SDA
   if (shippingTitle === SHIPPING_SDA) {
     if (hasTag(currentTags, TAG_MERGE_OK) || hasTag(currentTags, TAG_MERGE_IN_CORSO)) {
       console.log("🔁 SDA -> già gestito/in corso, skip:", orderName);
@@ -356,7 +349,6 @@ async function handleFulfillmentCreate(payload) {
 
   console.log(`📦 fulfillments/create: ${orderName} | tracking: ${trackingNumber} | TEST_MODE: ${TEST_MODE}`);
 
-  // procediamo solo per ordine SDA (o tag SPEDISCI_ORA)
   if (!(triggerShippingTitle === SHIPPING_SDA || hasTag(triggerTags, TAG_SPEDISCI_ORA))) {
     console.log("ℹ️ fulfillment di ordine non SDA, ignoro:", orderName);
     return "OK ignored";
@@ -367,22 +359,19 @@ async function handleFulfillmentCreate(payload) {
     return "SKIP no customer";
   }
 
-  // idempotenza
   if (hasTag(triggerTags, TAG_MERGE_OK)) {
     console.log("🔁 MERGE_OK già presente, skip:", orderName);
     return "SKIP already merged";
   }
 
-  // tutti gli ordini customer
   const list = await shopifyRest(
     `/admin/api/2026-01/orders.json?status=any&limit=250&customer_id=${customerId}&fields=id,name,tags,fulfillment_status`,
     { method: "GET" }
   );
   const orders = list.orders || [];
 
-  // giacenze = tag GIACENZA e non evase
   const giacenze = orders.filter((o) => {
-    const fs = o.fulfillment_status; // null | unfulfilled | partial | fulfilled
+    const fs = o.fulfillment_status;
     const notShipped = fs == null || fs === "unfulfilled";
     return hasTag(o.tags || "", TAG_GIACENZA) && notShipped;
   });
@@ -392,11 +381,9 @@ async function handleFulfillmentCreate(payload) {
   for (const o of giacenze) {
     console.log(`➡️ Accorpo ordine ${o.name} (${o.id}) con tracking ${trackingNumber}`);
 
-    // 1) prendi FO via REST
     const fosRest = await getFulfillmentOrdersRest(o.id);
     const foGids = fosRest.map((fo) => fulfillmentOrderGidFromRestId(fo.id));
 
-    // 2) release hold
     if (foGids.length) {
       console.log("   - Release hold FO:", foGids);
       for (const gid of foGids) await releaseFulfillmentOrderHold(gid);
@@ -404,7 +391,6 @@ async function handleFulfillmentCreate(payload) {
       console.log("   - ⚠️ Nessun FO trovato per ordine giacenza:", o.id);
     }
 
-    // 3) crea fulfillment per ogni FO (REST)
     for (const fo of fosRest) {
       if (fo.status === "closed" || fo.status === "cancelled") continue;
 
@@ -427,7 +413,6 @@ async function handleFulfillmentCreate(payload) {
       });
     }
 
-    // 4) tag ordine giacenza: rimuovi GIACENZA, aggiungi MERGE_OK
     const wouldTags = addTags(removeTags(o.tags || "", [TAG_GIACENZA]), [TAG_MERGE_OK]);
     console.log("   - Aggiorno tags GIACENZA ->", wouldTags);
 
@@ -437,14 +422,13 @@ async function handleFulfillmentCreate(payload) {
     });
   }
 
-  // 5) chiudi merge su ordine trigger: aggiungi MERGE_OK e togli MERGE_IN_CORSO
   const triggerWould = removeTags(addTags(triggerTags, [TAG_MERGE_OK]), [TAG_MERGE_IN_CORSO]);
   console.log("✅ Chiudo merge su ordine SDA:", orderName, "->", triggerWould);
 
   await shopifyRestWrite(`/admin/api/2026-01/orders/${orderId}.json`, {
     method: "PUT",
     body: { order: { id: orderId, tags: triggerWould } },
-    });
+  });
 
   return "OK merged";
 }
@@ -455,7 +439,6 @@ async function handleFulfillmentCreate(payload) {
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end();
 
-  // read raw body
   const rawBody = await new Promise((resolve, reject) => {
     let data = "";
     req.on("data", (chunk) => (data += chunk));
@@ -464,7 +447,7 @@ export default async function handler(req, res) {
   });
 
   const hmacHeader = req.headers["x-shopify-hmac-sha256"];
-  const topic = req.headers["x-shopify-topic"]; // orders/paid | fulfillments/create
+  const topic = req.headers["x-shopify-topic"];
 
   try {
     if (!hmacHeader || typeof hmacHeader !== "string") {
@@ -498,7 +481,6 @@ export default async function handler(req, res) {
     return res.status(200).send("OK (topic ignored)");
   } catch (err) {
     console.error("❌ Webhook error:", err);
-    // 200 per evitare retry infiniti mentre sviluppi
     return res.status(200).send("ERROR handled");
   }
 }
