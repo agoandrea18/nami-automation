@@ -262,9 +262,39 @@ async function handleOrdersPaid(payload) {
       body: { order: { id: orderId, tags: wouldTags } },
     });
 
-    const foGids = (live?.fulfillmentOrders?.nodes || []).map(n => n.id);
-    console.log("🧊 ACCUMULA -> vorrei mettere HOLD su FO:", foGids);
-    if (foGids.length) await holdFulfillmentOrders(foGids);
+    async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function getFulfillmentOrderGids(orderId) {
+  const orderGid = `gid://shopify/Order/${orderId}`;
+  const q = `
+    query FO($id: ID!) {
+      order(id: $id) {
+        fulfillmentOrders(first: 50) { nodes { id status } }
+      }
+    }
+  `;
+  const data = await shopifyGraphql(q, { id: orderGid });
+  return (data?.order?.fulfillmentOrders?.nodes || []).map(n => n.id);
+}
+
+// ...
+let foGids = (live?.fulfillmentOrders?.nodes || []).map(n => n.id);
+
+if (!foGids.length) {
+  // retry 3 volte: 2s, 5s, 10s
+  const waits = [2000, 5000, 10000];
+  for (const w of waits) {
+    console.log(`🕒 ACCUMULA -> FO vuoti, riprovo tra ${w}ms...`);
+    await sleep(w);
+    foGids = await getFulfillmentOrderGids(orderId);
+    if (foGids.length) break;
+  }
+}
+
+console.log("🧊 ACCUMULA -> vorrei mettere HOLD su FO:", foGids);
+if (foGids.length) await holdFulfillmentOrders(foGids);
+else console.log("⚠️ ACCUMULA -> ancora FO vuoti dopo retry, non posso mettere HOLD");
+
 
     return "OK GIACENZA (test ok)";
   }
